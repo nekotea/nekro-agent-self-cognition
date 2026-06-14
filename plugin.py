@@ -502,7 +502,7 @@ async def self_cognition_inject(ctx: schemas.AgentCtx) -> str:
 # ---------------------------------------------------------------------------
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.TOOL,
+    SandboxMethodType.AGENT,
     name="搜索网络",
     description=(
         "对时效性较强或不够了解的话题进行网络搜索，获取最新信息后自行整理成观点。"
