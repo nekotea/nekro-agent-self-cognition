@@ -1,12 +1,13 @@
 """自我认知记忆插件
 
-让Bot拥有自己的观点、偏好和对参与过的讨论的记忆。
+让Bot拥有自己的观点、偏好和对参与过的讨论的记忆，以及对群友的认知画像。
 
 工作流程：
-- 提示注入（零API调用）：从话题槽静态读取已召回记忆注入上下文
-- LLM主动刷新：发现注入记忆与当前话题不符时，调用「刷新话题记忆」（AGENT）
-  LLM自己描述话题和上下文，系统据此向量搜索并更新话题槽
-- LLM写入：对话中形成明确观点时，调用「记录自我认知」（BEHAVIOR）
+- 提示注入（零API调用）：从两类槽静态读取已召回记忆注入上下文
+    - 话题记忆槽（max 2）：Bot自身对话题的观点、参与过的讨论
+    - 角色画像槽（max 4）：Bot对特定群友的了解
+- LLM主动刷新：发现注入内容与当前话题/人物不符时，调用对应刷新工具（AGENT，触发重新调用）
+- LLM写入：对话中形成明确认知时，调用「记录认知」（BEHAVIOR）
 """
 
 import time
@@ -27,8 +28,8 @@ from nekro_agent.services.plugin.schema import SandboxMethodType
 plugin = NekroPlugin(
     name="自我认知记忆",
     module_name="self_cognition",
-    description="让Bot记住自己的观点、偏好和参与过的讨论，对话时语义召回相关记忆，使Bot更有自我意识。",
-    version="2.0.0",
+    description="让Bot记住自己的观点和对群友的了解，对话时分类语义召回，使Bot更有自我意识和人情味。",
+    version="3.0.0",
     author="Teeea",
     url="https://github.com/nekotea/nekro-agent-self-cognition",
 )
@@ -41,17 +42,22 @@ class SelfCognitionConfig(ConfigBase):
     MAX_TOPIC_SLOTS: int = Field(
         default=2,
         title="最大话题槽数",
-        description="同时注入到上下文的最大话题数量，超出时淘汰最旧的话题槽。",
+        description="同时注入的最大话题记忆数量（Bot自身观点/讨论），超出时淘汰最旧的。",
     )
-    MAX_TOPIC_CONTENT_CHARS: int = Field(
+    MAX_PERSONA_SLOTS: int = Field(
+        default=4,
+        title="最大角色画像槽数",
+        description="同时注入的最大群友画像数量，超出时淘汰最旧的。",
+    )
+    MAX_SLOT_CONTENT_CHARS: int = Field(
         default=300,
-        title="单话题内容字数上限",
-        description="注入到提示词中单个话题记忆的最大字符数（超出部分截断）。",
+        title="单槽内容字数上限",
+        description="注入到提示词中单个槽的最大字符数（超出部分截断）。",
     )
     RECALL_TOP_K: int = Field(
         default=4,
         title="最大召回条数",
-        description="每次话题刷新最多召回的记忆条数。",
+        description="每次刷新最多从向量数据库召回的记忆条数。",
     )
     RECALL_SCORE_THRESHOLD: float = Field(
         default=0.72,
@@ -65,8 +71,8 @@ class SelfCognitionConfig(ConfigBase):
     )
     SLOT_TTL: int = Field(
         default=7200,
-        title="话题槽过期时间(秒)",
-        description="话题槽闲置超过此时间后自动失效，防止跨会话残留。",
+        title="槽过期时间(秒)",
+        description="话题槽和画像槽闲置超过此时间后自动失效，防止跨会话残留。",
     )
 
 
@@ -74,20 +80,28 @@ config = plugin.get_config(SelfCognitionConfig)
 
 
 # ---------------------------------------------------------------------------
-# 话题槽（每个 chat_key 最多 MAX_TOPIC_SLOTS 个）
+# 槽数据结构
 # ---------------------------------------------------------------------------
 
 @dataclass
 class TopicSlot:
-    topic_query: str    # LLM 描述的话题，作为槽的唯一标识
-    injected_text: str  # 格式化好的注入块（限字数后）
+    topic_query: str    # LLM 描述的话题，作为唯一标识
+    injected_text: str
+    created_at: float
+
+
+@dataclass
+class PersonaSlot:
+    person_name: str    # 群友名称，作为唯一标识
+    injected_text: str
     created_at: float
 
 
 _topic_slots: dict[str, list[TopicSlot]] = {}
+_persona_slots: dict[str, list[PersonaSlot]] = {}
 
 
-def _get_active_slots(chat_key: str) -> list[TopicSlot]:
+def _get_active_topic_slots(chat_key: str) -> list[TopicSlot]:
     now = time.time()
     slots = _topic_slots.get(chat_key, [])
     active = [s for s in slots if (now - s.created_at) < config.SLOT_TTL]
@@ -96,8 +110,17 @@ def _get_active_slots(chat_key: str) -> list[TopicSlot]:
     return active
 
 
-def _push_slot(chat_key: str, slot: TopicSlot) -> None:
-    slots = _get_active_slots(chat_key)
+def _get_active_persona_slots(chat_key: str) -> list[PersonaSlot]:
+    now = time.time()
+    slots = _persona_slots.get(chat_key, [])
+    active = [s for s in slots if (now - s.created_at) < config.SLOT_TTL]
+    if len(active) != len(slots):
+        _persona_slots[chat_key] = active
+    return active
+
+
+def _push_topic_slot(chat_key: str, slot: TopicSlot) -> None:
+    slots = _get_active_topic_slots(chat_key)
     for i, s in enumerate(slots):
         if s.topic_query == slot.topic_query:
             slots[i] = slot
@@ -108,6 +131,20 @@ def _push_slot(chat_key: str, slot: TopicSlot) -> None:
         slots.pop(0)
     slots.append(slot)
     _topic_slots[chat_key] = slots
+
+
+def _push_persona_slot(chat_key: str, slot: PersonaSlot) -> None:
+    slots = _get_active_persona_slots(chat_key)
+    for i, s in enumerate(slots):
+        if s.person_name == slot.person_name:
+            slots[i] = slot
+            _persona_slots[chat_key] = slots
+            return
+    if len(slots) >= config.MAX_PERSONA_SLOTS:
+        slots.sort(key=lambda s: s.created_at)
+        slots.pop(0)
+    slots.append(slot)
+    _persona_slots[chat_key] = slots
 
 
 # ---------------------------------------------------------------------------
@@ -186,15 +223,15 @@ async def _upsert(point_id: str, vector: list, payload: dict) -> bool:
         return False
 
 
-def _build_slot_text(topic_query: str, memories: list[dict]) -> str:
-    """将召回记忆格式化为话题块，限制总字符数"""
-    lines = [f"### 话题：{topic_query}"]
+def _build_slot_text(header: str, memories: list[dict]) -> str:
+    """将召回记忆格式化为注入块，限制总字符数"""
+    lines = [header]
     chars_used = 0
     for m in memories:
         ts = m["updated_at"] or m["created_at"]
         date_str = f" [{time.strftime('%Y-%m-%d', time.localtime(ts))}]" if ts else ""
         line = f"- **{m['topic']}**{date_str}: {m['content']}"
-        remaining = config.MAX_TOPIC_CONTENT_CHARS - chars_used
+        remaining = config.MAX_SLOT_CONTENT_CHARS - chars_used
         if remaining <= 0:
             break
         if len(line) > remaining:
@@ -206,41 +243,57 @@ def _build_slot_text(topic_query: str, memories: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 提示注入：静态读取话题槽，零 API 调用
+# 提示注入：静态读取两类槽，零 API 调用
 # ---------------------------------------------------------------------------
 
 @plugin.mount_prompt_inject_method("self_cognition_inject", "自我认知记忆注入")
 async def self_cognition_inject(ctx: schemas.AgentCtx) -> str:
-    slots = _get_active_slots(ctx.chat_key)
-    lines = ["## 我的观点与记忆 (Self Cognition)"]
-    if not slots:
-        lines.append(
-            "（暂无已加载的记忆。若当前对话涉及你可能有观点的话题、"
-            "或涉及你可能认识的群友，请调用「刷新话题记忆」工具主动查询。）"
+    topic_slots = _get_active_topic_slots(ctx.chat_key)
+    persona_slots = _get_active_persona_slots(ctx.chat_key)
+
+    if not topic_slots and not persona_slots:
+        return (
+            "## 我的观点与认知 (Self Cognition)\n"
+            "（暂无已加载的记忆。若当前对话涉及你可能有观点的话题，请调用「刷新话题记忆」；"
+            "若涉及某位群友，请调用「刷新角色画像」。）"
         )
-    else:
-        lines.append(
-            "（若以下记忆与当前话题或人物不匹配，请调用「刷新话题记忆」工具更新；"
-            "最多同时保留两个话题槽。）"
-        )
-        for slot in slots:
+
+    lines = ["## 我的观点与认知 (Self Cognition)"]
+
+    lines.append(
+        "### 话题记忆（最多2个，不符时调用「刷新话题记忆」更新）"
+    )
+    if topic_slots:
+        for slot in topic_slots:
             lines.append(slot.injected_text)
+    else:
+        lines.append("（暂无，可调用「刷新话题记忆」加载。）")
+
+    lines.append(
+        "### 角色画像（最多4个，缺少某人时调用「刷新角色画像」加载）"
+    )
+    if persona_slots:
+        for slot in persona_slots:
+            lines.append(slot.injected_text)
+    else:
+        lines.append("（暂无，可调用「刷新角色画像」加载。）")
+
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# 沙盒方法：LLM 主动刷新话题记忆
+# 沙盒方法：刷新话题记忆
 # ---------------------------------------------------------------------------
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.AGENT,
     name="刷新话题记忆",
     description=(
-        "当上下文中注入的话题记忆与当前讨论话题不匹配时调用，"
-        "或对话涉及新话题、特定群友时主动加载相关记忆。"
-        "用自己的语言描述当前话题或人物，并附上简短的上下文，"
-        "系统将据此语义搜索并更新注入到对话中的记忆槽（最多保留两个话题）。"
-        "示例：topic_description='小明的游戏习惯'，topic_description='关于AI取代创意工作的讨论'。"
+        "当话题记忆槽中的内容与当前讨论话题不匹配时调用，或对话涉及新话题时主动加载。"
+        "用自己的语言描述当前话题，附上简短上下文，"
+        "系统将语义搜索并更新话题记忆槽（最多同时保留2个话题）。"
+        "仅用于Bot自身观点/立场/参与过的讨论，群友相关请用「刷新角色画像」。"
+        "示例：topic_description='关于AI是否会取代创意工作的讨论'"
     ),
 )
 async def refresh_topic_memory(
@@ -251,12 +304,11 @@ async def refresh_topic_memory(
     """Refresh Topic Memory (刷新话题记忆)
 
     Args:
-        topic_description: 用自己的语言描述当前话题或人物，例如 "AI是否会取代创意工作者"、"小明的近况和爱好"
-        context_hint: 当前对话的简短上下文补充，帮助更准确地匹配记忆
+        topic_description: 用自己的语言描述当前话题，例如 "AI是否会取代创意工作者"
+        context_hint: 当前对话的简短背景，帮助更准确地匹配记忆
     """
     if not topic_description:
         return "错误：请提供话题描述"
-
     if not await _ensure_collection():
         return "错误：向量数据库暂不可用"
 
@@ -269,24 +321,79 @@ async def refresh_topic_memory(
     memories = await _search(vec, config.RECALL_TOP_K, config.RECALL_SCORE_THRESHOLD)
 
     if not memories:
-        slot_text = f"### 话题：{topic_description}\n（暂无相关记忆）"
-        result_msg = f"话题「{topic_description}」暂无相关记忆，可继续对话后调用「记录自我认知」保存观点。"
+        slot_text = f"#### 话题：{topic_description}\n（暂无相关记忆）"
+        result_msg = f"话题「{topic_description}」暂无相关记忆，可在形成观点后调用「记录认知」保存。"
     else:
-        slot_text = _build_slot_text(topic_description, memories)
+        slot_text = _build_slot_text(f"#### 话题：{topic_description}", memories)
         items = "\n".join(f"  - {m['topic']}: {m['content'][:80]}" for m in memories)
         result_msg = f"已加载话题「{topic_description}」的记忆（{len(memories)} 条）：\n{items}"
 
-    _push_slot(_ctx.chat_key, TopicSlot(
+    _push_topic_slot(_ctx.chat_key, TopicSlot(
         topic_query=topic_description,
         injected_text=slot_text,
         created_at=time.time(),
     ))
-    logger.debug(f"[自我认知] 话题槽更新: chat={_ctx.chat_key} topic={topic_description} memories={len(memories)}")
+    logger.debug(f"[自我认知] 话题槽更新: {topic_description} ({len(memories)} 条)")
     return result_msg
 
 
 # ---------------------------------------------------------------------------
-# 沙盒方法：记录自我认知
+# 沙盒方法：刷新角色画像
+# ---------------------------------------------------------------------------
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.AGENT,
+    name="刷新角色画像",
+    description=(
+        "当对话涉及某位群友，而角色画像槽中没有此人或内容已过时时调用。"
+        "提供群友的名称或昵称，系统将语义搜索该人的相关记忆并更新角色画像槽"
+        "（最多同时保留4个人的画像）。"
+        "示例：person_name='小明'，context_hint='他在说自己的游戏配置'"
+    ),
+)
+async def refresh_persona(
+    _ctx: schemas.AgentCtx,
+    person_name: str,
+    context_hint: str = "",
+) -> str:
+    """Refresh Persona (刷新角色画像)
+
+    Args:
+        person_name: 群友的名称或昵称，例如 "小明"、"阿强"
+        context_hint: 当前对话中关于此人的简短背景，帮助更准确地匹配记忆
+    """
+    if not person_name:
+        return "错误：请提供群友名称"
+    if not await _ensure_collection():
+        return "错误：向量数据库暂不可用"
+
+    query = f"群友{person_name} {context_hint}".strip()
+    try:
+        vec = await embed_text(query)
+    except Exception as e:
+        return f"错误：嵌入失败 - {e}"
+
+    memories = await _search(vec, config.RECALL_TOP_K, config.RECALL_SCORE_THRESHOLD)
+
+    if not memories:
+        slot_text = f"#### 群友：{person_name}\n（暂无相关记忆）"
+        result_msg = f"群友「{person_name}」暂无画像记忆，可在了解更多后调用「记录认知」保存。"
+    else:
+        slot_text = _build_slot_text(f"#### 群友：{person_name}", memories)
+        items = "\n".join(f"  - {m['topic']}: {m['content'][:80]}" for m in memories)
+        result_msg = f"已加载群友「{person_name}」的画像（{len(memories)} 条）：\n{items}"
+
+    _push_persona_slot(_ctx.chat_key, PersonaSlot(
+        person_name=person_name,
+        injected_text=slot_text,
+        created_at=time.time(),
+    ))
+    logger.debug(f"[自我认知] 角色画像槽更新: {person_name} ({len(memories)} 条)")
+    return result_msg
+
+
+# ---------------------------------------------------------------------------
+# 沙盒方法：记录认知
 # ---------------------------------------------------------------------------
 
 @plugin.mount_sandbox_method(
@@ -294,9 +401,9 @@ async def refresh_topic_memory(
     name="记录认知",
     description=(
         "记录或更新以下两类认知，若已存在高度相似的记忆则自动更新，否则新建词条：\n"
-        "1. Bot自身的观点、偏好、立场——调用时机：Bot在对话中形成明确观点、或内化了他人观点时；\n"
-        "2. Bot对某位群友的了解——调用时机：得知群友的职业、爱好、宠物、设备、在玩的游戏、"
-        "在做的项目等具体信息时，或主动向群友提问后得到回答时。\n"
+        "1. Bot自身的观点、偏好、立场——Bot在对话中形成明确观点、或内化了他人观点时调用；\n"
+        "2. Bot对某位群友的了解——得知群友的职业、爱好、宠物、设备、在玩的游戏、"
+        "在做的项目等具体信息时，或主动向群友提问后得到回答时调用。\n"
         "topic 格式示例：\n"
         "  - 自身观点：「音乐偏好」「对AI伦理的看法」\n"
         "  - 群友认知：「群友[小明]的游戏爱好」「群友[小红]的职业背景」「群友[阿强]的机器配置」\n"
@@ -306,7 +413,7 @@ async def refresh_topic_memory(
         "  - 「小红是前端工程师，最近在做一个React项目」"
     ),
 )
-async def record_self_cognition(
+async def record_cognition(
     _ctx: schemas.AgentCtx,
     topic: str,
     content: str,
@@ -319,7 +426,6 @@ async def record_self_cognition(
     """
     if not topic or not content:
         return "错误：topic 和 content 均不能为空"
-
     if not await _ensure_collection():
         return "错误：向量数据库暂不可用"
 
@@ -342,8 +448,8 @@ async def record_self_cognition(
         }
         ok = await _upsert(ex["id"], vec, payload)
         if ok:
-            # 该话题记忆已更新，清除当前会话所有槽让LLM下次重新拉取最新内容
             _topic_slots.pop(_ctx.chat_key, None)
+            _persona_slots.pop(_ctx.chat_key, None)
             return f"已更新现有记忆（相似度 {ex['score']:.2f}）：「{ex['topic']}」→「{topic}」"
         return "写入失败，请稍后重试"
     else:
@@ -362,4 +468,5 @@ async def record_self_cognition(
 @plugin.mount_cleanup_method()
 async def clean_up():
     _topic_slots.clear()
+    _persona_slots.clear()
     logger.info("[自我认知] 插件资源已清理。")
