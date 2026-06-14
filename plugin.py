@@ -227,10 +227,12 @@ async def _ensure_collection() -> bool:
 
 
 async def _search_qdrant(vector: list, top_k: int, score_threshold: float) -> list[dict]:
+    logger.debug(f"[自我认知][Qdrant] 搜索: top_k={top_k} threshold={score_threshold} vec_dim={len(vector)}")
     client = await nekro_core.get_qdrant_client()
     if client is None:
         return []
     try:
+        t0 = time.time()
         results = await client.search(
             collection_name=COLLECTION_NAME,
             query_vector=vector,
@@ -238,7 +240,8 @@ async def _search_qdrant(vector: list, top_k: int, score_threshold: float) -> li
             score_threshold=score_threshold,
             with_payload=True,
         )
-        return [
+        elapsed = time.time() - t0
+        hits = [
             {
                 "id": str(r.id),
                 "score": r.score,
@@ -249,24 +252,44 @@ async def _search_qdrant(vector: list, top_k: int, score_threshold: float) -> li
             }
             for r in results
         ]
+        logger.debug(
+            f"[自我认知][Qdrant] 搜索完成 {elapsed*1000:.0f}ms 命中{len(hits)}条: "
+            + " | ".join(f"{h['topic'][:20]} ({h['score']:.3f})" for h in hits)
+        )
+        return hits
     except Exception as e:
         logger.error(f"[自我认知] Qdrant 搜索失败: {e}")
         return []
 
 
 async def _upsert_qdrant(point_id: str, vector: list, payload: dict) -> bool:
+    logger.debug(
+        f"[自我认知][Qdrant] upsert: id={point_id[:8]}… "
+        f"topic={payload.get('topic','')!r} content={str(payload.get('content',''))[:60]!r}"
+    )
     client = await nekro_core.get_qdrant_client()
     if client is None:
         return False
     try:
+        t0 = time.time()
         await client.upsert(
             collection_name=COLLECTION_NAME,
             points=[qdrant_models.PointStruct(id=point_id, vector=vector, payload=payload)],
         )
+        logger.debug(f"[自我认知][Qdrant] upsert 完成 {(time.time()-t0)*1000:.0f}ms")
         return True
     except Exception as e:
         logger.error(f"[自我认知] Qdrant upsert 失败: {e}")
         return False
+
+
+async def _embed(text: str, caller: str) -> list:
+    """embed_text 包装器，记录调用方、文本和耗时"""
+    logger.debug(f"[自我认知][Embed] {caller}: {text[:80]!r}")
+    t0 = time.time()
+    vec = await embed_text(text)
+    logger.debug(f"[自我认知][Embed] {caller} 完成 {(time.time()-t0)*1000:.0f}ms dim={len(vec)}")
+    return vec
 
 
 def _build_slot_text(header: str, memories: list[dict]) -> str:
@@ -300,18 +323,28 @@ async def _proactive_monitor_loop():
         try:
             await asyncio.sleep(config.PROACTIVE_CHECK_INTERVAL)
             if not config.PROACTIVE_ENABLED:
+                logger.debug("[自我认知][Monitor] 主动监控已禁用，跳过本轮")
                 continue
 
             now = time.time()
             trigger_threshold = config.PROACTIVE_TRIGGER_MINUTES * 60
+            logger.debug(
+                f"[自我认知][Monitor] 开始检查周期: {len(_unresponded)} 个频道有待处理消息 "
+                f"触发阈值={trigger_threshold}s 最少消息数={config.PROACTIVE_MIN_MESSAGES}"
+            )
 
             for chat_key, msgs in list(_unresponded.items()):
                 if chat_key in _triggered:
+                    logger.debug(f"[自我认知][Monitor] {chat_key}: 已触发，跳过")
                     continue
                 if len(msgs) < config.PROACTIVE_MIN_MESSAGES:
+                    logger.debug(f"[自我认知][Monitor] {chat_key}: {len(msgs)}条消息，未达阈值{config.PROACTIVE_MIN_MESSAGES}，跳过")
                     continue
                 oldest_ts = msgs[0].ts
+                age = int(now - oldest_ts)
+                logger.debug(f"[自我认知][Monitor] {chat_key}: {len(msgs)}条消息，最老={age}s前，阈值={int(trigger_threshold)}s")
                 if now - oldest_ts < trigger_threshold:
+                    logger.debug(f"[自我认知][Monitor] {chat_key}: 未到触发时间（还差{int(trigger_threshold-age)}s），跳过")
                     continue
 
                 # 构造主动触发的系统消息
@@ -367,9 +400,13 @@ async def _capture_message(ctx: schemas.AgentCtx, message: ChatMessage) -> Optio
             sender_name=message.sender_name or message.sender_id,
             text=text[:200],
         ))
-        # 只保留最近30条，防止内存膨胀
         if len(pending) > 30:
             _unresponded[chat_key] = pending[-30:]
+        logger.debug(
+            f"[自我认知][Monitor] 记录消息 chat={chat_key} "
+            f"sender={message.sender_name or message.sender_id} "
+            f"pending={len(_unresponded[chat_key])} text={text[:50]!r}"
+        )
     return None
 
 
@@ -380,20 +417,32 @@ async def _capture_message(ctx: schemas.AgentCtx, message: ChatMessage) -> Optio
 @plugin.mount_prompt_inject_method("self_cognition_inject", "自我认知记忆注入")
 async def self_cognition_inject(ctx: schemas.AgentCtx) -> str:
     chat_key = ctx.chat_key
+    logger.debug(f"[自我认知][Inject] 开始注入 chat_key={chat_key}")
     # Bot 即将响应，清除该频道的未回复消息和主动触发标记
-    _unresponded.pop(chat_key, None)
+    cleared = len(_unresponded.pop(chat_key, []))
+    was_triggered = chat_key in _triggered
     _triggered.discard(chat_key)
+    if cleared or was_triggered:
+        logger.debug(f"[自我认知][Inject] 清除未回复记录 {cleared} 条 triggered={was_triggered}")
 
     topic_slots = _get_active_topic_slots(chat_key)
     persona_slots = _get_active_persona_slots(chat_key)
 
+    logger.debug(
+        f"[自我认知][Inject] 槽状态: "
+        f"话题={[s.topic_query for s in topic_slots]} "
+        f"画像={[s.person_name for s in persona_slots]}"
+    )
+
     if not topic_slots and not persona_slots:
-        return (
+        result = (
             "## 我的观点与认知 (Self Cognition)\n"
             "（暂无已加载的记忆。若当前对话涉及你可能有观点的话题，请调用「刷新话题记忆」；"
             "若涉及某位群友，请调用「刷新角色画像」。"
             "对于不熟悉的时效性话题，可先调用「搜索网络」获取信息再形成观点。）"
         )
+        logger.debug(f"[自我认知][Inject] 无槽，注入提示文字")
+        return result
 
     lines = ["## 我的观点与认知 (Self Cognition)"]
 
@@ -411,7 +460,9 @@ async def self_cognition_inject(ctx: schemas.AgentCtx) -> str:
     else:
         lines.append("（暂无，可调用「刷新角色画像」加载。）")
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    logger.debug(f"[自我认知][Inject] 注入内容({len(result)}字):\n{result}")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -436,15 +487,20 @@ async def web_search(
     Args:
         query: 搜索词，应清晰具体，例如 "怪物猎人荒野弓箭毕业配装2025" 而非 "怪猎配装"
     """
+    logger.debug(f"[自我认知][Search] 调用: query={query!r} 配额={_search_counter['count']}/{config.SEARCH_DAILY_LIMIT}")
     if not query:
         return "错误：请提供搜索词"
 
     if not _search_quota_ok():
         if not config.SEARCH_API_KEY:
+            logger.debug("[自我认知][Search] 未配置 API Key，跳过")
             return "搜索功能未配置（请在插件设置中填写 SEARCH_API_KEY）"
+        logger.debug(f"[自我认知][Search] 配额已用尽 {_search_counter['count']}/{config.SEARCH_DAILY_LIMIT}")
         return f"搜索配额已用尽（今日已使用 {_search_counter['count']}/{config.SEARCH_DAILY_LIMIT} 次），明日恢复"
 
     try:
+        t0 = time.time()
+        logger.debug(f"[自我认知][Search] 发起请求 → {SEARCH_ENDPOINT}")
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post(
                 SEARCH_ENDPOINT,
@@ -456,6 +512,8 @@ async def web_search(
             )
             r.raise_for_status()
             data = r.json()
+        elapsed = time.time() - t0
+        logger.debug(f"[自我认知][Search] 响应 {r.status_code} {elapsed*1000:.0f}ms")
     except httpx.HTTPStatusError as e:
         logger.error(f"[自我认知] 搜索请求失败: {e.response.status_code} {e.response.text[:200]}")
         return f"搜索失败（HTTP {e.response.status_code}）"
@@ -466,6 +524,10 @@ async def web_search(
     used = _increment_search_usage()
     refs = data.get("references", [])
     max_r = min(config.SEARCH_MAX_RESULTS, len(refs))
+    logger.debug(
+        f"[自我认知][Search] 得到 {len(refs)} 条结果，取前 {max_r} 条，今日已用 {used}/{config.SEARCH_DAILY_LIMIT}: "
+        + " | ".join(f"{r.get('title','')[:30]}({r.get('date','')[:10]})" for r in refs[:max_r])
+    )
 
     if not refs:
         return f"搜索「{query}」未找到相关结果（今日已用 {used}/{config.SEARCH_DAILY_LIMIT} 次）"
@@ -479,7 +541,9 @@ async def web_search(
         lines.append(f"**{title}**（{date}）\n{content}\n来源：{url}\n")
 
     lines.append("请根据以上信息整理你自己的观点，并调用「记录认知」保存后再回复。")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    logger.debug(f"[自我认知][Search] 返回内容 {len(result)} 字")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +570,7 @@ async def refresh_topic_memory(
         topic_description: 用自己的语言描述当前话题，例如 "AI是否会取代创意工作者"
         context_hint: 当前对话的简短背景，帮助更准确地匹配记忆
     """
+    logger.debug(f"[自我认知][刷新话题] 入参: topic={topic_description!r} hint={context_hint!r} chat={_ctx.chat_key}")
     if not topic_description:
         return "错误：请提供话题描述"
     if not await _ensure_collection():
@@ -513,7 +578,7 @@ async def refresh_topic_memory(
 
     query = f"{topic_description} {context_hint}".strip()
     try:
-        vec = await embed_text(query)
+        vec = await _embed(query, "刷新话题记忆")
     except Exception as e:
         return f"错误：嵌入失败 - {e}"
 
@@ -533,6 +598,7 @@ async def refresh_topic_memory(
     _push_topic_slot(_ctx.chat_key, TopicSlot(
         topic_query=topic_description, injected_text=slot_text, created_at=time.time(),
     ))
+    logger.debug(f"[自我认知][刷新话题] 完成: 找到 {len(memories)} 条，槽已更新 topic={topic_description!r}")
     return result_msg
 
 
@@ -559,6 +625,7 @@ async def refresh_persona(
         person_name: 群友的名称或昵称，例如 "小明"、"阿强"
         context_hint: 当前对话中关于此人的简短背景
     """
+    logger.debug(f"[自我认知][刷新画像] 入参: person={person_name!r} hint={context_hint!r} chat={_ctx.chat_key}")
     if not person_name:
         return "错误：请提供群友名称"
     if not await _ensure_collection():
@@ -566,7 +633,7 @@ async def refresh_persona(
 
     query = f"群友{person_name} {context_hint}".strip()
     try:
-        vec = await embed_text(query)
+        vec = await _embed(query, "刷新角色画像")
     except Exception as e:
         return f"错误：嵌入失败 - {e}"
 
@@ -583,6 +650,7 @@ async def refresh_persona(
     _push_persona_slot(_ctx.chat_key, PersonaSlot(
         person_name=person_name, injected_text=slot_text, created_at=time.time(),
     ))
+    logger.debug(f"[自我认知][刷新画像] 完成: 找到 {len(memories)} 条，槽已更新 person={person_name!r}")
     return result_msg
 
 
@@ -617,6 +685,7 @@ async def record_cognition(
         topic: 主题标签。自身观点用「偏好/看法/立场」等，群友认知用「群友[名字]的xxx」格式
         content: 具体内容，以第一人称叙述，记录事实或观点及其来源
     """
+    logger.debug(f"[自我认知][记录] 入参: topic={topic!r} content={content[:60]!r} chat={_ctx.chat_key}")
     if not topic or not content:
         return "错误：topic 和 content 均不能为空"
     if not await _ensure_collection():
@@ -624,7 +693,7 @@ async def record_cognition(
 
     summary = f"{topic}：{content}"
     try:
-        vec = await embed_text(summary)
+        vec = await _embed(summary, "记录认知")
     except Exception as e:
         return f"错误：嵌入失败 - {e}"
 
@@ -633,6 +702,7 @@ async def record_cognition(
 
     if existing:
         ex = existing[0]
+        logger.debug(f"[自我认知][记录] 去重命中: score={ex['score']:.3f} existing_topic={ex['topic']!r} → 更新")
         ok = await _upsert_qdrant(ex["id"], vec, {
             "topic": topic, "content": content,
             "created_at": ex.get("created_at", now), "updated_at": now,
@@ -640,13 +710,16 @@ async def record_cognition(
         if ok:
             _topic_slots.pop(_ctx.chat_key, None)
             _persona_slots.pop(_ctx.chat_key, None)
+            logger.debug(f"[自我认知][记录] 更新完成，已清除 {_ctx.chat_key} 的槽缓存")
             return f"已更新现有记忆（相似度 {ex['score']:.2f}）：「{ex['topic']}」→「{topic}」"
         return "写入失败，请稍后重试"
     else:
+        logger.debug(f"[自我认知][记录] 无重复，新建词条 topic={topic!r}")
         ok = await _upsert_qdrant(str(uuid.uuid4()), vec, {
             "topic": topic, "content": content, "created_at": now, "updated_at": now,
         })
         if ok:
+            logger.debug(f"[自我认知][记录] 新词条写入成功")
             return f"已记录新记忆：「{topic}」"
         return "写入失败，请稍后重试"
 
