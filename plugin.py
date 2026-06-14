@@ -17,7 +17,7 @@ import datetime
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 from pydantic import Field
@@ -74,6 +74,16 @@ class SelfCognitionConfig(ConfigBase):
         description="每日最多调用搜索API次数，超出后当日自动禁用搜索。")
     SEARCH_MAX_RESULTS: int = Field(default=5, title="搜索最大返回条数",
         description="每次搜索最多返回给LLM的参考资料条数（1-10）。")
+    # 关注范围
+    ALLOWED_CHAT_KEYS: List[str] = Field(
+        default_factory=list,
+        title="关注的会话列表",
+        description=(
+            "只对列表内的会话启用记忆捕获和主动监控。"
+            "支持完整 chat_key（如 onebot_v11-group_331320444）或纯群号（如 331320444）。"
+            "留空则关注所有会话（不推荐，消息多的群会占用大量资源）。"
+        ),
+    )
     # 主动触发
     PROACTIVE_ENABLED: bool = Field(default=True, title="启用主动监控",
         description="是否在群聊有未回复讨论时主动触发LLM判断是否参与。")
@@ -179,6 +189,16 @@ _bg_task: Optional[asyncio.Task] = None
 # ---------------------------------------------------------------------------
 
 _search_counter: dict = {"date": "", "count": 0}
+
+
+def _is_chat_allowed(chat_key: str) -> bool:
+    """检查 chat_key 是否在关注列表内（留空则全部允许）"""
+    if not config.ALLOWED_CHAT_KEYS:
+        return True
+    for entry in config.ALLOWED_CHAT_KEYS:
+        if entry == chat_key or chat_key.endswith(f"_{entry}"):
+            return True
+    return False
 
 
 def _search_quota_ok() -> bool:
@@ -390,6 +410,8 @@ def _ensure_bg_task():
 
 @plugin.mount_on_user_message()
 async def _capture_message(ctx: schemas.AgentCtx, message: ChatMessage) -> Optional[MsgSignal]:
+    if not _is_chat_allowed(ctx.chat_key):
+        return None
     _ensure_bg_task()
     text = (message.content_text or "").strip()
     if text:
@@ -417,7 +439,7 @@ async def _capture_message(ctx: schemas.AgentCtx, message: ChatMessage) -> Optio
 @plugin.mount_prompt_inject_method("self_cognition_inject", "自我认知记忆注入")
 async def self_cognition_inject(ctx: schemas.AgentCtx) -> str:
     chat_key = ctx.chat_key
-    logger.debug(f"[自我认知][Inject] 开始注入 chat_key={chat_key}")
+    logger.debug(f"[自我认知][Inject] 开始注入 chat_key={chat_key} allowed={_is_chat_allowed(chat_key)}")
     # Bot 即将响应，清除该频道的未回复消息和主动触发标记
     cleared = len(_unresponded.pop(chat_key, []))
     was_triggered = chat_key in _triggered
