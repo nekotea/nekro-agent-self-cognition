@@ -215,12 +215,12 @@ async def self_cognition_inject(ctx: schemas.AgentCtx) -> str:
     lines = ["## 我的观点与记忆 (Self Cognition)"]
     if not slots:
         lines.append(
-            "（暂无已加载的话题记忆。若当前对话涉及你可能有观点或印象的话题，"
-            "请调用「刷新话题记忆」工具主动查询。）"
+            "（暂无已加载的记忆。若当前对话涉及你可能有观点的话题、"
+            "或涉及你可能认识的群友，请调用「刷新话题记忆」工具主动查询。）"
         )
     else:
         lines.append(
-            "（若以下记忆与当前话题不匹配，请调用「刷新话题记忆」工具更新；"
+            "（若以下记忆与当前话题或人物不匹配，请调用「刷新话题记忆」工具更新；"
             "最多同时保留两个话题槽。）"
         )
         for slot in slots:
@@ -237,9 +237,10 @@ async def self_cognition_inject(ctx: schemas.AgentCtx) -> str:
     name="刷新话题记忆",
     description=(
         "当上下文中注入的话题记忆与当前讨论话题不匹配时调用，"
-        "或对话涉及新话题时主动加载相关记忆。"
-        "用自己的语言描述当前话题，并附上简短的上下文，"
+        "或对话涉及新话题、特定群友时主动加载相关记忆。"
+        "用自己的语言描述当前话题或人物，并附上简短的上下文，"
         "系统将据此语义搜索并更新注入到对话中的记忆槽（最多保留两个话题）。"
+        "示例：topic_description='小明的游戏习惯'，topic_description='关于AI取代创意工作的讨论'。"
     ),
 )
 async def refresh_topic_memory(
@@ -250,8 +251,8 @@ async def refresh_topic_memory(
     """Refresh Topic Memory (刷新话题记忆)
 
     Args:
-        topic_description: 用自己的语言描述当前话题，例如 "AI是否会取代创意工作者"
-        context_hint: 当前对话的简短背景补充，帮助更准确地匹配记忆
+        topic_description: 用自己的语言描述当前话题或人物，例如 "AI是否会取代创意工作者"、"小明的近况和爱好"
+        context_hint: 当前对话的简短上下文补充，帮助更准确地匹配记忆
     """
     if not topic_description:
         return "错误：请提供话题描述"
@@ -290,11 +291,19 @@ async def refresh_topic_memory(
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.BEHAVIOR,
-    name="记录自我认知",
+    name="记录认知",
     description=(
-        "记录或更新Bot自己的观点、偏好、立场或对某个话题参与过的讨论。"
-        "若已存在高度相似的记忆则自动更新，否则新建词条。"
-        "调用时机：当Bot在对话中形成了明确观点，或内化了他人观点时。"
+        "记录或更新以下两类认知，若已存在高度相似的记忆则自动更新，否则新建词条：\n"
+        "1. Bot自身的观点、偏好、立场——调用时机：Bot在对话中形成明确观点、或内化了他人观点时；\n"
+        "2. Bot对某位群友的了解——调用时机：得知群友的职业、爱好、宠物、设备、在玩的游戏、"
+        "在做的项目等具体信息时，或主动向群友提问后得到回答时。\n"
+        "topic 格式示例：\n"
+        "  - 自身观点：「音乐偏好」「对AI伦理的看法」\n"
+        "  - 群友认知：「群友[小明]的游戏爱好」「群友[小红]的职业背景」「群友[阿强]的机器配置」\n"
+        "content 示例：\n"
+        "  - 「我偏好电子音乐，觉得lo-fi很适合写代码时听」\n"
+        "  - 「小明最近在玩怪物猎人和CSGO，我问了怪猎用什么武器，他说是弓」\n"
+        "  - 「小红是前端工程师，最近在做一个React项目」"
     ),
 )
 async def record_self_cognition(
@@ -302,11 +311,11 @@ async def record_self_cognition(
     topic: str,
     content: str,
 ) -> str:
-    """Record Self Cognition (记录自我认知)
+    """Record Cognition (记录认知)
 
     Args:
-        topic: 主题标签，例如 "音乐偏好" "对AI伦理的看法"
-        content: 具体观点，应当是Bot自己的第一人称表述
+        topic: 主题标签。自身观点用「偏好/看法/立场」等，群友认知用「群友[名字]的xxx」格式
+        content: 具体内容，以第一人称叙述，记录事实或观点及其来源
     """
     if not topic or not content:
         return "错误：topic 和 content 均不能为空"
