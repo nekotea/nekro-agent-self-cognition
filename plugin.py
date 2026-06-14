@@ -434,31 +434,41 @@ async def self_cognition_inject(ctx: schemas.AgentCtx) -> str:
         f"画像={[s.person_name for s in persona_slots]}"
     )
 
+    PERSONA_HINT = (
+        "【角色画像使用规则】群友在对话中发言时，若其画像不在下方槽中，"
+        "请主动调用「刷新角色画像」加载，再结合已知信息参与对话。"
+        "得知群友新信息时，调用「记录认知」保存。"
+    )
+    TOPIC_HINT = (
+        "【话题记忆使用规则】当前话题与下方槽内容不符时，"
+        "调用「刷新话题记忆」更新。对不熟悉的时效性话题可先「搜索网络」再「记录认知」。"
+    )
+
     if not topic_slots and not persona_slots:
         result = (
             "## 我的观点与认知 (Self Cognition)\n"
-            "（暂无已加载的记忆。若当前对话涉及你可能有观点的话题，请调用「刷新话题记忆」；"
-            "若涉及某位群友，请调用「刷新角色画像」。"
-            "对于不熟悉的时效性话题，可先调用「搜索网络」获取信息再形成观点。）"
+            "（暂无已加载的记忆。）\n"
+            f"{TOPIC_HINT}\n"
+            f"{PERSONA_HINT}"
         )
         logger.debug(f"[自我认知][Inject] 无槽，注入提示文字")
         return result
 
-    lines = ["## 我的观点与认知 (Self Cognition)"]
+    lines = ["## 我的观点与认知 (Self Cognition)", TOPIC_HINT]
 
-    lines.append("### 话题记忆（最多2个，不符时调用「刷新话题记忆」更新）")
+    lines.append("### 话题记忆（最多2个）")
     if topic_slots:
         for slot in topic_slots:
             lines.append(slot.injected_text)
     else:
         lines.append("（暂无，可调用「刷新话题记忆」加载。）")
 
-    lines.append("### 角色画像（最多4个，缺少某人时调用「刷新角色画像」加载）")
+    lines.append(f"### 角色画像（最多4个）\n{PERSONA_HINT}")
     if persona_slots:
         for slot in persona_slots:
             lines.append(slot.injected_text)
     else:
-        lines.append("（暂无，可调用「刷新角色画像」加载。）")
+        lines.append("（暂无。）")
 
     result = "\n".join(lines)
     logger.debug(f"[自我认知][Inject] 注入内容({len(result)}字):\n{result}")
@@ -610,8 +620,11 @@ async def refresh_topic_memory(
     SandboxMethodType.TOOL,
     name="刷新角色画像",
     description=(
-        "当对话涉及某位群友，而角色画像槽中没有此人或内容已过时时调用。"
-        "提供群友的名称或昵称，系统将语义搜索该人的相关记忆并更新角色画像槽（最多4个）。"
+        "加载你对某位群友的已知信息（职业、爱好、设备、游戏、项目、宠物等）到角色画像槽。"
+        "【主动调用时机】：① 群友在当前对话中发言，而其画像不在槽中时；"
+        "② 刚得知关于某群友的新信息，想先查看已有记录再决定是否更新时。"
+        "最多同时缓存4人，超出时自动淘汰最早的。"
+        "若想保存关于群友的新信息，请在查看后调用「记录认知」。"
     ),
 )
 async def refresh_persona(
