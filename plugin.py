@@ -551,7 +551,7 @@ async def web_search(
 # ---------------------------------------------------------------------------
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="刷新话题记忆",
     description=(
         "当话题记忆槽中的内容与当前讨论话题不匹配时调用，或对话涉及新话题时主动加载。"
@@ -607,7 +607,7 @@ async def refresh_topic_memory(
 # ---------------------------------------------------------------------------
 
 @plugin.mount_sandbox_method(
-    SandboxMethodType.AGENT,
+    SandboxMethodType.TOOL,
     name="刷新角色画像",
     description=(
         "当对话涉及某位群友，而角色画像槽中没有此人或内容已过时时调用。"
